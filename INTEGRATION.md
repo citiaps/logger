@@ -107,6 +107,36 @@ GinRecovery -> OTel middleware -> GinLogger -> middlewares de app -> routes
 method path route status latency_ms client_ip user_agent request_id body_size
 ```
 
+Cuando el handler conoce el resultado de dominio, debe anotar la request para que el log HTTP final no quede solo como `http.request`:
+
+```go
+logger.SetRequestEvent(c, "dspace.document.download.failed")
+logger.SetRequestError(c, err,
+    logger.ErrorKind("external_api"),
+    logger.Operation("download"),
+    slog.Int("external_status", 502),
+    slog.String("external_item_ref", itemRef),
+    slog.String("external_doc_ref", docRef),
+)
+```
+
+Con eso, el log HTTP final conserva los campos HTTP y queda consultable por dominio:
+
+```json
+{
+  "event": "dspace.document.download.failed",
+  "http_event": "http.request",
+  "status": 500,
+  "route": "/api/v1/signatures/download/:request_id",
+  "error": "bad gateway",
+  "error_kind": "external_api",
+  "operation": "download",
+  "external_status": 502
+}
+```
+
+Regla: para errores 4xx/5xx conocidos por la aplicación, preferir anotar `SetRequestEvent` con un evento de dominio. `event=http.request` debería quedar para requests sin resultado de dominio específico.
+
 `GinRecovery` emite `event=http.panic` con:
 
 ```text

@@ -75,6 +75,28 @@ app.Use(logger.GinRecovery(nil))
 | `request_id` | Header `X-Request-ID` o generado automáticamente |
 | `body_size` | Tamaño de respuesta |
 
+Por defecto `event` es `http.request`. Si un handler conoce el resultado de dominio, puede anotar la request para que el log HTTP final incluya ese evento:
+
+```go
+func DownloadDocument(c *gin.Context) {
+    document, err := service.Download(c.Request.Context(), id)
+    if err != nil {
+        logger.SetRequestEvent(c, "dspace.document.download.failed")
+        logger.SetRequestError(c, err,
+            logger.ErrorKind("external_api"),
+            logger.Operation("download"),
+            slog.Int("external_status", 502),
+            slog.String("external_item_ref", itemRef),
+        )
+        c.JSON(500, gin.H{"message": "failed to download document"})
+        return
+    }
+    c.JSON(200, document)
+}
+```
+
+El log final de la request quedaría con `event=dspace.document.download.failed` y `http_event=http.request`, lo que permite alertar directamente por evento de dominio y conservar métricas HTTP.
+
 `GinRecovery` emite panics como JSON:
 
 | Campo | Descripción |
@@ -135,6 +157,14 @@ logger.Method(method)
 logger.Status(status)
 logger.LatencyMS(ms)
 logger.Operation("upload")
+```
+
+Helpers Gin disponibles:
+
+```go
+logger.SetRequestEvent(c, "dspace.document.download.failed")
+logger.SetRequestError(c, err, logger.ErrorKind("external_api"))
+logger.AddRequestAttrs(c, slog.String("document_id", documentID))
 ```
 
 ## Migración gradual

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,6 +14,37 @@ import (
 )
 
 const requestIDHeader = "X-Request-ID"
+
+const (
+	ginRequestEventKey = "logger.request_event"
+	ginRequestAttrsKey = "logger.request_attrs"
+)
+
+func SetRequestEvent(c *gin.Context, event string) {
+	if c == nil || event == "" {
+		return
+	}
+	c.Set(ginRequestEventKey, event)
+}
+
+func AddRequestAttrs(c *gin.Context, attrs ...slog.Attr) {
+	if c == nil || len(attrs) == 0 {
+		return
+	}
+	existing, _ := c.Get(ginRequestAttrsKey)
+	if current, ok := existing.([]slog.Attr); ok {
+		c.Set(ginRequestAttrsKey, append(current, attrs...))
+		return
+	}
+	c.Set(ginRequestAttrsKey, slices.Clone(attrs))
+}
+
+func SetRequestError(c *gin.Context, err error, attrs ...slog.Attr) {
+	if err != nil {
+		attrs = append([]slog.Attr{WithError(err)}, attrs...)
+	}
+	AddRequestAttrs(c, attrs...)
+}
 
 func GinLogger(logger *slog.Logger) gin.HandlerFunc {
 	if logger == nil {
@@ -37,8 +69,16 @@ func GinLogger(logger *slog.Logger) gin.HandlerFunc {
 			level = slog.LevelWarn
 		}
 
+		event := "http.request"
+		if requestEvent, ok := c.Get(ginRequestEventKey); ok {
+			if value, ok := requestEvent.(string); ok && value != "" {
+				event = value
+			}
+		}
+
 		attrs := []slog.Attr{
-			slog.String("event", "http.request"),
+			slog.String("event", event),
+			slog.String("http_event", "http.request"),
 			slog.Int("status", statusCode),
 			slog.String("method", c.Request.Method),
 			slog.String("path", path),
@@ -57,6 +97,12 @@ func GinLogger(logger *slog.Logger) gin.HandlerFunc {
 				errStrs[i] = e.Err.Error()
 			}
 			attrs = append(attrs, slog.Any("gin_errors", errStrs))
+		}
+
+		if requestAttrs, ok := c.Get(ginRequestAttrsKey); ok {
+			if values, ok := requestAttrs.([]slog.Attr); ok {
+				attrs = append(attrs, values...)
+			}
 		}
 
 		if span := trace.SpanFromContext(c.Request.Context()); span.SpanContext().HasTraceID() {
