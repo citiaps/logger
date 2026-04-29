@@ -22,6 +22,8 @@ const (
 
 type Config struct {
 	ServiceName string
+	Environment string
+	Version     string
 	Level       slog.Level
 	Format      Format
 	Output      io.Writer
@@ -37,6 +39,9 @@ func (c *Config) defaults() {
 	if c.Output == nil {
 		c.Output = os.Stdout
 	}
+	if c.ServiceName == "" {
+		c.ServiceName = "unknown-service"
+	}
 }
 
 func Init(cfg Config) *slog.Logger {
@@ -46,7 +51,7 @@ func Init(cfg Config) *slog.Logger {
 		Level: cfg.Level,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
-				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))
+				a.Value = slog.StringValue(a.Value.Time().UTC().Format(time.RFC3339Nano))
 			}
 			return a
 		},
@@ -60,18 +65,56 @@ func Init(cfg Config) *slog.Logger {
 		handler = slog.NewJSONHandler(cfg.Output, opts)
 	}
 
-	logger := slog.New(handler).With(slog.String("service", cfg.ServiceName))
+	attrs := []any{slog.String("service", cfg.ServiceName)}
+	if cfg.Environment != "" {
+		attrs = append(attrs, slog.String("env", cfg.Environment))
+	}
+	if cfg.Version != "" {
+		attrs = append(attrs, slog.String("version", cfg.Version))
+	}
+
+	logger := slog.New(handler).With(attrs...)
 	slog.SetDefault(logger)
 	return logger
 }
 
 func InitFromEnv() *slog.Logger {
 	cfg := Config{
-		ServiceName: os.Getenv("SERVICE_NAME"),
+		ServiceName: serviceNameFromEnv(),
+		Environment: envFromEnv(),
+		Version:     versionFromEnv(),
 		Level:       parseLevel(os.Getenv("LOG_LEVEL")),
 		Format:      Format(strings.ToLower(os.Getenv("LOG_FORMAT"))),
 	}
 	return Init(cfg)
+}
+
+func serviceNameFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv("SERVICE_NAME")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME")); v != "" {
+		return v
+	}
+	return "unknown-service"
+}
+
+func envFromEnv() string {
+	for _, key := range []string{"ENV", "GO_REST_ENV", "APP_ENV", "GIN_MODE"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func versionFromEnv() string {
+	for _, key := range []string{"SERVICE_VERSION", "VERSION", "GIT_SHA", "COMMIT_SHA"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func parseLevel(s string) slog.Level {
@@ -104,6 +147,30 @@ func WithError(err error) slog.Attr {
 	}
 	return slog.String("error", err.Error())
 }
+
+func Event(value string) slog.Attr { return slog.String("event", value) }
+
+func ErrorKind(value string) slog.Attr { return slog.String("error_kind", value) }
+
+func ErrorCode(value string) slog.Attr { return slog.String("error_code", value) }
+
+func Retryable(value bool) slog.Attr { return slog.Bool("retryable", value) }
+
+func RequestID(value string) slog.Attr { return slog.String("request_id", value) }
+
+func CorrelationID(value string) slog.Attr { return slog.String("correlation_id", value) }
+
+func UserID(value any) slog.Attr { return slog.Any("user_id", value) }
+
+func Route(value string) slog.Attr { return slog.String("route", value) }
+
+func Method(value string) slog.Attr { return slog.String("method", value) }
+
+func Status(value int) slog.Attr { return slog.Int("status", value) }
+
+func LatencyMS(value float64) slog.Attr { return slog.Float64("latency_ms", value) }
+
+func Operation(value string) slog.Attr { return slog.String("operation", value) }
 
 func Info(ctx context.Context, msg string, args ...any) {
 	FromContext(ctx).InfoContext(ctx, msg, args...)
@@ -147,7 +214,7 @@ func Fatalf(ctx context.Context, format string, args ...any) {
 	var pcs [1]uintptr
 	runtime.Callers(2, pcs[:])
 	r := slog.NewRecord(time.Now(), slog.LevelError, msg, pcs[0])
-	_ = slog.Default().Handler().Handle(ctx, r)
+	_ = FromContext(ctx).Handler().Handle(ctx, r)
 	os.Exit(1)
 }
 
