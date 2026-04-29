@@ -1,13 +1,14 @@
-# Instrucciones Para Cada Proyecto
+# Integration Guide
 
-Estas son las acciones que debe aplicar cada backend Go para adoptar la base semántica del logger.
+Esta guía describe cómo integrar `github.com/citiaps/logger` en cualquier servicio Go. El objetivo es que cada servicio emita logs JSON por `stdout` con campos consistentes para Docker/Nomad, OpenTelemetry y VictoriaLogs.
 
 ## 1. Dependencia
 
-Cuando exista tag publicado:
+Instalar la versión publicada:
 
 ```bash
 go get github.com/citiaps/logger@v0.2.0
+go mod tidy
 ```
 
 Durante desarrollo local se puede usar temporalmente:
@@ -16,14 +17,14 @@ Durante desarrollo local se puede usar temporalmente:
 replace github.com/citiaps/logger => ../logger
 ```
 
-Regla: no dejar `replace` en ramas de release/deploy.
+No dejar `replace` en ramas de release/deploy.
 
-## 2. Variables de entorno obligatorias
+## 2. Variables De Entorno
 
-Cada servicio debe definir al menos:
+Cada servicio debería definir al menos:
 
 ```bash
-SERVICE_NAME=<nombre-estable>
+SERVICE_NAME=<stable-service-name>
 ENV=prod
 LOG_LEVEL=info
 LOG_FORMAT=json
@@ -32,13 +33,31 @@ LOG_FORMAT=json
 Recomendado:
 
 ```bash
-SERVICE_VERSION=<tag-o-git-sha>
-OTEL_SERVICE_NAME=<mismo-service-name>
+SERVICE_VERSION=<tag-or-git-sha>
+OTEL_SERVICE_NAME=<stable-service-name>
 ```
 
-Nombres propuestos:
+Resolución de nombre de servicio:
 
-| Proyecto | `SERVICE_NAME` |
+```text
+SERVICE_NAME -> OTEL_SERVICE_NAME -> unknown-service
+```
+
+Resolución de ambiente:
+
+```text
+ENV -> GO_REST_ENV -> APP_ENV -> GIN_MODE
+```
+
+Resolución de versión:
+
+```text
+SERVICE_VERSION -> VERSION -> GIT_SHA -> COMMIT_SHA
+```
+
+Ejemplos para los servicios conversados:
+
+| Proyecto | `SERVICE_NAME` sugerido |
 |---|---|
 | E-Firma-Backend | `e-firma-backend` |
 | E-Firma-Servicios-Backend | `e-firma-servicios-backend` |
@@ -48,59 +67,91 @@ Nombres propuestos:
 
 ## 3. Inicialización
 
-En `main.go`, llamar una vez al inicio:
+En `main.go`, inicializar una sola vez al comienzo del proceso:
 
 ```go
 logger.InitFromEnv()
 ```
 
-Idealmente antes de inicializar DB, OTel, Gin u otros componentes que puedan loggear.
+Hacerlo antes de inicializar DB, OpenTelemetry, Gin, workers, cronjobs u otros componentes que puedan loggear.
 
-## 4. Gin sin logs de texto plano
+## 4. Uso Con Gin
 
-Reemplazar:
+No usar `gin.Default()`, porque agrega logger/recovery de Gin en texto plano.
 
-```go
-app := gin.Default()
-```
-
-por:
+Usar:
 
 ```go
 app := gin.New()
-app.Use(logger.GinLogger(nil))
 app.Use(logger.GinRecovery(nil))
+app.Use(otelgin.Middleware(serviceName)) // si el servicio usa OpenTelemetry
+app.Use(logger.GinLogger(nil))
 ```
 
-Luego mantener los middlewares propios:
+Después agregar los middlewares propios del servicio:
 
 ```go
 app.Use(middleware.CorsMiddleware())
-app.Use(otelgin.Middleware(config.OpenTelemetryServiceName()))
+app.Use(middleware.AuthMiddleware())
 ```
 
-Motivo: `gin.Default()` agrega logger/recovery en texto plano y rompe el contrato JSON por línea.
+Orden recomendado:
 
-## 5. Reemplazar salidas no JSON
+```text
+GinRecovery -> OTel middleware -> GinLogger -> middlewares de app -> routes
+```
 
-Buscar y migrar:
+`GinLogger` emite `event=http.request` con campos HTTP estándar:
+
+```text
+method path route status latency_ms client_ip user_agent request_id body_size
+```
+
+`GinRecovery` emite `event=http.panic` con:
+
+```text
+error error_kind=panic stack method path route status request_id
+```
+
+## 5. Eliminar Salidas No JSON
+
+Migrar cualquier escritura directa a `stdout`/`stderr` o logger de texto plano.
 
 | Patrón | Reemplazo |
 |---|---|
 | `fmt.Println(...)` | `logger.Info(ctx, "message", ...)` |
 | `fmt.Printf(...)` | `logger.Infof(ctx, ...)` temporalmente |
 | `log.Printf(...)` | `logger.Infof(ctx, ...)` temporalmente |
-| `panic(err)` operacional | `logger.Fatal(ctx, "...", logger.WithError(err))` |
+| `log.Fatal(...)` | `logger.Fatal(ctx, "message", ...)` |
+| `panic(err)` operacional | `logger.Fatal(ctx, "message", logger.WithError(err))` |
 | `gin.Default()` | `gin.New()` + `GinLogger` + `GinRecovery` |
-| `lumberjack` / logs a archivo | eliminar; Docker/Nomad maneja stdout |
+| logs a archivo local | eliminar; usar `stdout` para Docker/Nomad |
 
-## 6. Estándar de errores
+Los panics verdaderamente no recuperables pueden existir, pero deberían ser excepcionales. En HTTP, `GinRecovery` los convierte en JSON.
+
+## 6. Logging Estructurado
+
+Preferir logs con campos key/value:
+
+```go
+logger.Info(ctx, "resource updated",
+    logger.Event("resource.updated"),
+    logger.UserID(userID),
+    "resource_id", resourceID,
+    "old_status", oldStatus,
+    "new_status", newStatus,
+)
+```
+
+Usar `Infof`, `Warnf`, `Errorf` y `Fatalf` solo como compatibilidad temporal al migrar desde `log.Printf`.
+
+## 7. Estándar De Errores
 
 Correcto:
 
 ```go
-logger.Error(ctx, "failed to create user",
-    logger.Event("user.create.failed"),
+logger.Error(ctx, "failed to create resource",
+    logger.Event("resource.create.failed"),
     logger.WithError(err),
     logger.ErrorKind("db"),
     logger.UserID(userID),
@@ -110,73 +161,82 @@ logger.Error(ctx, "failed to create user",
 Incorrecto:
 
 ```go
-logger.Infof(ctx, "Error al crear usuario: %v", err)
+logger.Infof(ctx, "Error creando recurso: %v", err)
 logger.Error(ctx, "Error: "+err.Error())
 logger.Error(ctx, "failed", "err", err)
 ```
 
-Usar siempre:
+Campos estándar de error:
 
 | Campo | Uso |
 |---|---|
-| `error` | Error real (`logger.WithError(err)`) |
-| `error_kind` | Categoría: `db`, `validation`, `external_api`, `auth`, `timeout`, `panic` |
+| `error` | Error real, usando `logger.WithError(err)` |
+| `error_kind` | Categoría general: `db`, `validation`, `external_api`, `auth`, `timeout`, `panic` |
 | `error_code` | Código interno/externo si existe |
 | `retryable` | `true` si corresponde reintento |
 
-## 7. Eventos recomendados
+Regla: `msg` es humano y corto; el error va en `error`.
 
-Eventos Auth:
+## 8. Eventos
+
+`event` es un nombre estable para buscar, medir y alertar. No depende del idioma ni del texto de `msg`.
+
+Formato recomendado:
+
+```text
+<domain>.<action>.<result>
+```
+
+Ejemplos genéricos:
 
 ```text
 auth.login.success
 auth.login.failed
-auth.token.refresh.success
-auth.token.refresh.failed
-auth.jwt.validation.failed
-auth.api_key.validation.failed
-```
-
-Eventos DSpace:
-
-```text
-dspace.login.success
-dspace.login.failed
-dspace.document.download.success
-dspace.document.download.failed
-dspace.document.upload.success
-dspace.document.upload.failed
-dspace.metadata.patch.failed
-```
-
-Eventos Firma:
-
-```text
-signature.request.created
-signature.request.failed
-signature.document.signed
-signature.document.uploaded
-signature.batch.started
-signature.batch.completed
-signature.batch.failed
-```
-
-Eventos Contraloría:
-
-```text
-contract.created
-contract.updated
-contract.status.changed
-contract.status.change.failed
-contract.document.uploaded
-contract.document.deleted
+resource.created
+resource.updated
+resource.deleted
+resource.create.failed
+external_api.request.failed
+job.started
+job.completed
+job.failed
 workflow.transition.success
 workflow.transition.failed
 ```
 
-## 8. Campos de dominio recomendados
+Ejemplos específicos para los servicios conversados:
 
-Firma:
+```text
+dspace.document.upload.failed
+dspace.document.download.failed
+signature.request.created
+signature.batch.completed
+contract.status.changed
+contract.status.change.failed
+```
+
+No todos los logs necesitan `event`. Usarlo cuando el log represente algo que se quiera buscar, medir o alertar.
+
+## 9. Campos De Dominio
+
+Cada servicio puede agregar campos propios, pero debe mantener nombres estables y consistentes.
+
+Campos comunes recomendados:
+
+```text
+user_id
+role
+system_id
+application_id
+request_id
+correlation_id
+operation
+external_status
+old_status
+new_status
+```
+
+Ejemplos específicos para los servicios conversados:
 
 ```text
 signature_request_id
@@ -184,55 +244,38 @@ batch_request_id
 document_id
 document_uuid
 signature_type
-document_status
 external_item_ref
 external_doc_ref
-```
-
-DSpace:
-
-```text
 dspace_uuid
 collection_uuid
 workspace_item_id
 bitstream_uuid
-operation
-external_status
-```
-
-Contraloría:
-
-```text
 contract_id
 num_convenio
 num_presupuesto
 workflow_id
-workflow_status
-old_status
-new_status
 cost_center_id
 ```
 
-Auth:
+Evitar variantes para el mismo concepto:
 
 ```text
-auth_method
-token_type
-login_result
-failure_reason
-user_id
-role
-system_id
-application_id
+userId / userid / id_user
+err / error_msg / error_details
+route_path / endpoint / url_path
 ```
 
-## 9. Compatibilidad temporal
+## 10. Compatibilidad Temporal
 
-Si el proyecto tiene muchas llamadas antiguas tipo `utils.LogError(...)`, se permite una capa temporal `utils/logger_compat.go`, pero debe cumplir:
+Si un servicio tiene muchas llamadas antiguas tipo `utils.LogError(...)`, se permite una capa temporal `utils/logger_compat.go`.
+
+Debe cumplir:
 
 - `LogError` emite nivel `ERROR`.
-- Si recibe un `error`, lo entrega como campo `error`.
-- No debe escribir a archivos ni usar colores ANSI en producción.
+- `LogWarn` emite nivel `WARN`.
+- Si recibe un `error`, debería pasarlo como campo `error` cuando sea posible.
+- No debe escribir a archivos.
+- No debe usar colores ANSI en producción.
 
 Ejemplo mínimo:
 
@@ -242,9 +285,9 @@ func LogError(format string, args ...any) {
 }
 ```
 
-Objetivo final: reemplazar compat por llamadas estructuradas con `logger.Event`, `logger.WithError`, etc.
+Objetivo final: reemplazar compat por llamadas estructuradas con `logger.Event`, `logger.WithError`, `logger.ErrorKind`, etc.
 
-## 10. Checklist de aceptación
+## 11. Checklist De Aceptación
 
 Antes de mergear en cada proyecto:
 
@@ -252,7 +295,7 @@ Antes de mergear en cada proyecto:
 go build ./...
 ```
 
-Buscar que no queden:
+Buscar que no queden fuentes comunes de logs no JSON:
 
 ```bash
 rg 'gin\.Default\('
@@ -265,7 +308,13 @@ rg 'lumberjack'
 Validar en ejecución que cada línea de stdout sea JSON válido y contenga al menos:
 
 ```text
-time level service env msg
+time level service msg
+```
+
+Si se define ambiente, también debe aparecer:
+
+```text
+env
 ```
 
 Para requests HTTP debe contener:
